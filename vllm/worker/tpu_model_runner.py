@@ -14,6 +14,7 @@ import torch_xla.runtime as xr
 from vllm.attention import AttentionMetadata, get_attn_backend
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.logits_process import LogitsProcessor
 from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.sampling_metadata import SamplingMetadata
@@ -59,6 +60,7 @@ class ModelInputForTPU(ModelRunnerInputBase):
     num_samples: int
     n: List[int]
     seq_groups: List[List[int]]
+    logit_processors: List[LogitsProcessor]
     is_first_multi_step: bool = True
     is_last_step: bool = True
     virtual_engine: int = 0
@@ -75,6 +77,7 @@ class ModelInputForTPU(ModelRunnerInputBase):
             "num_samples": self.num_samples,
             "n": self.n,
             "seq_groups": self.seq_groups,
+            "logit_processors": self.logit_processors,
             "is_first_multi_step": self.is_first_multi_step,
             "is_last_step": self.is_last_step,
             "virtual_engine": self.virtual_engine,
@@ -150,10 +153,11 @@ class TPUModelRunner(ModelRunnerBase[ModelInputForTPU]):
         model = model.eval()
         xm.wait_device_ops()
         model = ModelWrapper(model)
-        self.model = torch.compile(model,
-                                   backend="openxla",
-                                   fullgraph=True,
-                                   dynamic=False)
+        self.model = model
+        # self.model = torch.compile(model,
+        #                            backend="openxla",
+        #                            fullgraph=True,
+        #                            dynamic=False)
 
     def _dummy_run(
         self,
@@ -498,13 +502,15 @@ class TPUModelRunner(ModelRunnerBase[ModelInputForTPU]):
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
         padded_batch_size: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[int], List[LogitsProcessor]]:
         assert len(seq_group_metadata_list) > 0
         t = []
         p = []
         n = []
+        logits_processors = []
         for seq_group_metadata in seq_group_metadata_list:
             sampling_params = seq_group_metadata.sampling_params
+            logits_processors.append(sampling_params.logits_processors)
             t.append(sampling_params.temperature)
             if sampling_params.top_p != 1 and not _ENABLE_TOP_P:
                 raise NotImplementedError(
@@ -540,7 +546,7 @@ class TPUModelRunner(ModelRunnerBase[ModelInputForTPU]):
 
         t = torch.tensor(t, dtype=torch.float32, device="cpu")
         p = torch.tensor(p, dtype=torch.float32, device="cpu")
-        return t, p, n
+        return t, p, n, logits_processors
 
     def prepare_model_input(
         self,
@@ -554,13 +560,15 @@ class TPUModelRunner(ModelRunnerBase[ModelInputForTPU]):
         # NOTE: We assume that all sequences in the group are all prompts or
         # all decodes.
         is_prompt = seq_group_metadata_list[0].is_prompt
+        logit_processor = seq_group_metadata_list[0].sampling_params.logits_processors
+        print(f"DEBUGPRINT[1]: tpu_model_runner.py:557: logit_processor={logit_processor}")
         if is_prompt:
             inputs = self._prepare_prompt(seq_group_metadata_list)
         else:
             inputs = self._prepare_decode(seq_group_metadata_list)
         input_tokens, input_positions, attn_metadata, input_lens = inputs
         padded_batch_size = input_tokens.shape[0]
-        t, p, n = self._prepare_sample(seq_group_metadata_list,
+        t, p, n, logits_processors = self._prepare_sample(seq_group_metadata_list,
                                        padded_batch_size)
         num_samples = _MAX_NUM_SAMPLES if is_prompt else 1
 
@@ -569,7 +577,7 @@ class TPUModelRunner(ModelRunnerBase[ModelInputForTPU]):
             for metadata in seq_group_metadata_list
         ]
         return ModelInputForTPU(input_tokens, input_positions, attn_metadata,
-                                input_lens, t, p, num_samples, n, seq_groups)
+                                input_lens, t, p, num_samples, n, seq_groups, logits_processors)
 
     def make_model_input_from_broadcasted_tensor_dict(
             self, tensor_dict: Dict[str, Any]) -> ModelInputForTPU:
@@ -763,6 +771,7 @@ class ModelWrapper(nn.Module):
         p: torch.Tensor,
         num_samples: int,
         kv_caches: List[Tuple[torch.Tensor, torch.Tensor]],
+        logit_processors: List[LogitsProcessor],
     ) -> torch.Tensor:
         """Executes the forward pass of the model and samples the next token.
 
@@ -822,6 +831,8 @@ class ModelWrapper(nn.Module):
         hidden_states = hidden_states.flatten(0, 1)
         logits = self.model.compute_logits(hidden_states, sampling_metadata)
 
+        logits = _apply_logits_processors(logits, logit_processors)
+
         # Argmax sampling.
         argmax_token_ids = torch.argmax(logits, dim=-1, keepdim=True)
         argmax_token_ids = argmax_token_ids.repeat(1, num_samples)
@@ -872,6 +883,46 @@ def _apply_top_p(logits: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
     logits = logits.masked_fill_(logits < cutoff_logit, -float("inf"))
     return logits
 
+def _apply_logits_processors(
+    logits: torch.Tensor,
+    logits_processors: List[LogitsProcessor],
+    **kwargs,
+) -> torch.Tensor:
+    # TODO: make a modification 
+    found_logits_processors = False
+    logits_processed = 0
+    for seq_group in sampling_metadata.seq_groups:
+        seq_ids = seq_group.seq_ids
+        sampling_params = seq_group.sampling_params
+        logits_processors = sampling_params.logits_processors
+        if logits_processors:
+            found_logits_processors = True
+
+            for seq_id, logits_row_idx in zip(seq_ids,
+                                              seq_group.sample_indices):
+                logits_row = logits[logits_row_idx]
+                past_tokens_ids = seq_group.seq_data[seq_id].output_token_ids
+                prompt_tokens_ids = seq_group.seq_data[seq_id].prompt_token_ids
+
+                for logits_processor in logits_processors:
+                    parameters = inspect.signature(logits_processor).parameters
+                    if len(parameters) == 3:
+                        logits_row = logits_processor(prompt_tokens_ids,
+                                                      past_tokens_ids,
+                                                      logits_row)
+                    else:
+                        logits_row = logits_processor(past_tokens_ids,
+                                                      logits_row)
+
+                logits[logits_row_idx] = logits_row
+
+        logits_processed += len(seq_group.sample_indices) + len(
+            seq_group.prompt_logprob_indices)
+
+    if found_logits_processors:
+        # verifies that no rows in logits were missed unexpectedly
+        assert logits_processed == logits.shape[0]
+    return logits
 
 def _make_decode_output(
     next_token_ids: List[int],
